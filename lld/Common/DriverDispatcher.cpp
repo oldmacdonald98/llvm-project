@@ -8,6 +8,7 @@
 
 #include "lld/Common/CommonLinkerContext.h"
 #include "lld/Common/Driver.h"
+#include "lld/Common/DriverDispatcher.h"
 #include "lld/Common/ErrorHandler.h"
 #include "lld/Common/Memory.h"
 #include "llvm/ADT/STLExtras.h"
@@ -21,6 +22,7 @@
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 #include <cstdlib>
+#include <iostream>
 
 using namespace lld;
 using namespace llvm;
@@ -28,7 +30,7 @@ using namespace llvm::sys;
 
 static void err(const Twine &s) { llvm::errs() << s << "\n"; }
 
-static Flavor getFlavor(StringRef s) {
+Flavor DriverDispatcher::getFlavor(StringRef s) {
   return StringSwitch<Flavor>(s)
       .CasesLower("ld", "ld.lld", "gnu", Gnu)
       .CasesLower("wasm", "ld-wasm", Wasm)
@@ -37,18 +39,18 @@ static Flavor getFlavor(StringRef s) {
       .Default(Invalid);
 }
 
-static cl::TokenizerCallback getDefaultQuotingStyle() {
+cl::TokenizerCallback DriverDispatcher::getDefaultQuotingStyle() {
   if (Triple(sys::getProcessTriple()).getOS() == Triple::Win32)
     return cl::TokenizeWindowsCommandLine;
   return cl::TokenizeGNUCommandLine;
 }
 
-static bool isPETargetName(StringRef s) {
+bool DriverDispatcher::isPETargetName(StringRef s) {
   return s == "i386pe" || s == "i386pep" || s == "thumb2pe" || s == "arm64pe" ||
          s == "arm64ecpe" || s == "arm64xpe" || s == "mipspe";
 }
 
-static std::optional<bool> isPETarget(llvm::ArrayRef<const char *> args) {
+std::optional<bool> DriverDispatcher::isPETarget(llvm::ArrayRef<const char *> args) {
   for (auto it = args.begin(); it + 1 != args.end(); ++it) {
     if (StringRef(*it) != "-m")
       continue;
@@ -80,7 +82,7 @@ static std::optional<bool> isPETarget(llvm::ArrayRef<const char *> args) {
 #endif
 }
 
-static Flavor parseProgname(StringRef progname) {
+Flavor DriverDispatcher::parseProgname(StringRef progname) {
   // Use GNU driver for "ld" by default.
   if (progname == "ld")
     return Gnu;
@@ -94,8 +96,7 @@ static Flavor parseProgname(StringRef progname) {
   return Invalid;
 }
 
-static Flavor
-parseFlavorWithoutMinGW(llvm::SmallVectorImpl<const char *> &argsV) {
+Flavor DriverDispatcher::parseFlavorWithoutMinGW(llvm::SmallVectorImpl<const char *> &argsV) {
   // Parse -flavor option.
   if (argsV.size() > 1 && argsV[1] == StringRef("-flavor")) {
     if (argsV.size() <= 2) {
@@ -124,7 +125,7 @@ parseFlavorWithoutMinGW(llvm::SmallVectorImpl<const char *> &argsV) {
   return f;
 }
 
-static Flavor parseFlavor(llvm::SmallVectorImpl<const char *> &argsV) {
+Flavor DriverDispatcher::parseFlavor(llvm::SmallVectorImpl<const char *> &argsV) {
   Flavor f = parseFlavorWithoutMinGW(argsV);
   if (f == Gnu) {
     auto isPE = isPETarget(argsV);
@@ -136,12 +137,12 @@ static Flavor parseFlavor(llvm::SmallVectorImpl<const char *> &argsV) {
   return f;
 }
 
-static Driver whichDriver(llvm::SmallVectorImpl<const char *> &argsV,
-                          llvm::ArrayRef<DriverDef> drivers) {
+Driver DriverDispatcher::whichDriver(llvm::SmallVectorImpl<const char *> &argsV) {
   Flavor f = parseFlavor(argsV);
   auto it =
       llvm::find_if(drivers, [=](auto &driverdef) { return driverdef.f == f; });
   if (it == drivers.end()) {
+    std::cout << "Driver is invalid or not available in this build." << std::endl;
     // Driver is invalid or not available in this build.
     return [](llvm::ArrayRef<const char *>, llvm::raw_ostream &,
               llvm::raw_ostream &, bool, bool) { return false; };
@@ -149,16 +150,18 @@ static Driver whichDriver(llvm::SmallVectorImpl<const char *> &argsV,
   return it->d;
 }
 
+DriverDispatcher::DriverDispatcher(llvm::ArrayRef<lld::DriverDef> drivers) {
+  this->drivers = std::vector<DriverDef>(drivers);
+}
+
 namespace lld {
 bool inTestOutputDisabled = false;
+} // namespace lld
 
-/// Universal linker main(). This linker emulates the gnu, darwin, or
-/// windows linker based on the argv[0] or -flavor option.
-int unsafeLldMain(llvm::ArrayRef<const char *> args,
-                  llvm::raw_ostream &stdoutOS, llvm::raw_ostream &stderrOS,
-                  llvm::ArrayRef<DriverDef> drivers, bool exitEarly) {
+
+bool DriverDispatcher::unsafeDispatch(llvm::ArrayRef<const char *> args, llvm::raw_ostream &stdoutOS, llvm::raw_ostream &stderrOS, bool exitEarly) {
   SmallVector<const char *, 256> argsV(args);
-  Driver d = whichDriver(argsV, drivers);
+  Driver d = whichDriver(argsV);
   // Run the driver. If an error occurs, false will be returned.
   int r = !d(argsV, stdoutOS, stderrOS, exitEarly, inTestOutputDisabled);
   // At this point 'r' is either 1 for error, and 0 for no error.
@@ -173,20 +176,17 @@ int unsafeLldMain(llvm::ArrayRef<const char *> args,
 
   return r;
 }
-} // namespace lld
 
-Result lld::lldMain(llvm::ArrayRef<const char *> args,
-                    llvm::raw_ostream &stdoutOS, llvm::raw_ostream &stderrOS,
-                    llvm::ArrayRef<DriverDef> drivers) {
-  int r = 0;
+Result DriverDispatcher::dispatch(llvm::ArrayRef<const char *> args, llvm::raw_ostream &stdoutOS, llvm::raw_ostream &stderrOS) {
+  bool r = false;
   {
     // The crash recovery is here only to be able to recover from arbitrary
     // control flow when fatal() is called (through setjmp/longjmp or
     // __try/__except).
     llvm::CrashRecoveryContext crc;
     if (!crc.RunSafely([&]() {
-          r = unsafeLldMain(args, stdoutOS, stderrOS, drivers,
-                            /*exitEarly=*/false);
+          r = unsafeDispatch(args, stdoutOS, stderrOS,
+                             /*exitEarly=*/false);
         }))
       return {crc.RetCode, /*canRunAgain=*/false};
   }
@@ -199,4 +199,22 @@ Result lld::lldMain(llvm::ArrayRef<const char *> args,
     return {r, /*canRunAgain=*/false};
   }
   return {r, /*canRunAgain=*/true};
+}
+
+namespace lld {
+/// Universal linker main(). This linker emulates the gnu, darwin, or
+/// windows linker based on the argv[0] or -flavor option.
+bool unsafeLldMain(llvm::ArrayRef<const char *> args,
+                   llvm::raw_ostream &stdoutOS, llvm::raw_ostream &stderrOS,
+                   llvm::ArrayRef<DriverDef> drivers, bool exitEarly) {
+  DriverDispatcher dispatcher(drivers);
+  return dispatcher.unsafeDispatch(args, stdoutOS, stderrOS, exitEarly);
+}
+} // namespace lld
+
+Result lld::lldMain(llvm::ArrayRef<const char *> args,
+                    llvm::raw_ostream &stdoutOS, llvm::raw_ostream &stderrOS,
+                    llvm::ArrayRef<DriverDef> drivers) {
+  DriverDispatcher dispatcher(drivers);
+  return dispatcher.dispatch(args, stdoutOS, stderrOS);
 }

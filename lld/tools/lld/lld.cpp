@@ -40,6 +40,7 @@
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
 #include <cstdlib>
+#include <lld/Common/DriverDispatcher.h>
 #include <optional>
 
 using namespace lld;
@@ -82,13 +83,14 @@ int lld_main(int argc, char **argv, const llvm::ToolContext &) {
   }
 
   ArrayRef<const char *> args(argv, argv + argc);
+  DriverDispatcher dispatcher(LLD_ALL_DRIVERS);
 
   // Not running in lit tests, just take the shortest codepath with global
   // exception handling and no memory cleanup on exit.
   if (!inTestVerbosity()) {
     int r =
-        lld::unsafeLldMain(args, llvm::outs(), llvm::errs(), LLD_ALL_DRIVERS,
-                           /*exitEarly=*/true);
+            dispatcher.unsafeDispatch(args, llvm::outs(), llvm::errs(),
+                                  /*exitEarly=*/true);
     return r;
   }
 
@@ -100,7 +102,7 @@ int lld_main(int argc, char **argv, const llvm::ToolContext &) {
     inTestOutputDisabled = (i != 1);
 
     // Execute one iteration.
-    auto r = lldMain(args, llvm::outs(), llvm::errs(), LLD_ALL_DRIVERS);
+    auto r = dispatcher.dispatch(args, llvm::outs(), llvm::errs());
     if (!r.canRunAgain)
       exitLld(r.retCode); // Exit now, can't re-execute again.
 
